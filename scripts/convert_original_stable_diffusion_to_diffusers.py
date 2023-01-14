@@ -315,26 +315,26 @@ def convert_ldm_unet_checkpoint(checkpoint, config, path=None, extract_ema=False
 
     unet_key = "model.diffusion_model."
     # at least a 100 parameters have to start with `model_ema` in order for the checkpoint to be EMA
-    if sum(k.startswith("model_ema") for k in keys) > 100:
+    if sum(k.startswith("model_ema") for k in keys) > 100 and extract_ema:
         print(f"Checkpoint {path} has both EMA and non-EMA weights.")
-        if extract_ema:
-            print(
-                "In this conversion only the EMA weights are extracted. If you want to instead extract the non-EMA"
-                " weights (useful to continue fine-tuning), please make sure to remove the `--extract_ema` flag."
-            )
-            for key in keys:
-                if key.startswith("model.diffusion_model"):
-                    flat_ema_key = "model_ema." + "".join(key.split(".")[1:])
-                    unet_state_dict[key.replace(unet_key, "")] = checkpoint.pop(flat_ema_key)
-        else:
+        print(
+            "In this conversion only the EMA weights are extracted. If you want to instead extract the non-EMA"
+            " weights (useful to continue fine-tuning), please make sure to remove the `--extract_ema` flag."
+        )
+        for key in keys:
+            if key.startswith("model.diffusion_model"):
+                flat_ema_key = "model_ema." + "".join(key.split(".")[1:])
+                unet_state_dict[key.replace(unet_key, "")] = checkpoint.pop(flat_ema_key)
+    else:
+        if sum(k.startswith("model_ema") for k in keys) > 100:
             print(
                 "In this conversion only the non-EMA weights are extracted. If you want to instead extract the EMA"
                 " weights (usually better for inference), please make sure to add the `--extract_ema` flag."
             )
 
-    for key in keys:
-        if key.startswith(unet_key):
-            unet_state_dict[key.replace(unet_key, "")] = checkpoint.pop(key)
+        for key in keys:
+            if key.startswith(unet_key):
+                unet_state_dict[key.replace(unet_key, "")] = checkpoint.pop(key)
 
     new_checkpoint = {}
 
@@ -443,8 +443,9 @@ def convert_ldm_unet_checkpoint(checkpoint, config, path=None, extract_ema=False
                 paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config
             )
 
-            if ["conv.weight", "conv.bias"] in output_block_list.values():
-                index = list(output_block_list.values()).index(["conv.weight", "conv.bias"])
+            output_block_list = {k: sorted(v) for k, v in output_block_list.items()}
+            if ["conv.bias", "conv.weight"] in output_block_list.values():
+                index = list(output_block_list.values()).index(["conv.bias", "conv.weight"])
                 new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.weight"] = unet_state_dict[
                     f"output_blocks.{i}.{index}.conv.weight"
                 ]
@@ -749,7 +750,10 @@ def convert_open_clip_checkpoint(checkpoint):
 
     d_model = int(checkpoint["cond_stage_model.model.text_projection"].shape[0])
 
-    text_model_dict["text_model.embeddings.position_ids"] = text_model.text_model.embeddings.get_buffer("position_ids")
+    if "cond_stage_model.model.text_projection" in checkpoint:
+        d_model = int(checkpoint["cond_stage_model.model.text_projection"].shape[0])
+    else:
+        d_model = 1024
 
     for key in keys:
         if "resblocks.23" in key:  # Diffusers drops the final layer and only uses the penultimate layer
@@ -854,7 +858,11 @@ if __name__ == "__main__":
     image_size = args.image_size
     prediction_type = args.prediction_type
 
-    checkpoint = torch.load(args.checkpoint_path)
+    if args.device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    else:
+        checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
 
     # Sometimes models don't have the global_step item
     if "global_step" in checkpoint:
@@ -863,41 +871,9 @@ if __name__ == "__main__":
         print("global_step key not found in model")
         global_step = None
 
-    chckpoint_dict_replacements = {
-    'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
-    'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
-    'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
-    }
+    if "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
 
-
-    def transform_checkpoint_dict_key(k):
-        for text, replacement in chckpoint_dict_replacements.items():
-            if k.startswith(text):
-                k = replacement + k[len(text):]
-
-        return k
-
-    def get_state_dict_from_checkpoint(pl_sd):
-        pl_sd = pl_sd.pop("state_dict", pl_sd)
-        pl_sd.pop("state_dict", None)
-
-        sd = {}
-        for k, v in pl_sd.items():
-            new_key = transform_checkpoint_dict_key(k)
-
-            if new_key is not None:
-                sd[new_key] = v
-
-        pl_sd.clear()
-        pl_sd.update(sd)
-
-        return pl_sd
-
-    def read_state_dict(checkpoint_file):
-        sd = get_state_dict_from_checkpoint(checkpoint_file)
-        return sd
-
-    checkpoint = read_state_dict(checkpoint)
     upcast_attention = False
     if args.original_config_file is None:
         key_name = "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_k.weight"
